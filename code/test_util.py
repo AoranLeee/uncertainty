@@ -8,16 +8,16 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-def test_all_case(net, image_list, num_classes, patch_size=(112, 112, 80), stride_xy=18, stride_z=4, save_result=True, test_save_path=None, preproc_fn=None):
+def test_all_case(net, image_list, num_classes, patch_size=(112, 112, 80), stride_xy=18, stride_z=4, save_result=True, test_save_path=None, preproc_fn=None, verbose=True):
     total_metric = 0.0
-    for image_path in tqdm(image_list):
+    for image_path in tqdm(image_list, disable=not verbose):
         id = image_path.split('/')[-1]
         h5f = h5py.File(image_path, 'r')
         image = h5f['image'][:]
         label = h5f['label'][:]
         if preproc_fn is not None:
             image = preproc_fn(image)
-        prediction, score_map = test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=num_classes)
+        prediction, score_map = test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=num_classes, verbose=verbose)
 
         if np.sum(prediction)==0:
             single_metric = (0,0,0,0)
@@ -30,12 +30,13 @@ def test_all_case(net, image_list, num_classes, patch_size=(112, 112, 80), strid
             nib.save(nib.Nifti1Image(image[:].astype(np.float32), np.eye(4)), test_save_path + id + "_img.nii.gz")
             nib.save(nib.Nifti1Image(label[:].astype(np.float32), np.eye(4)), test_save_path + id + "_gt.nii.gz")
     avg_metric = total_metric / len(image_list)
-    print('average metric is {}'.format(avg_metric))
+    if verbose:
+        print('average metric is {}'.format(avg_metric))
 
     return avg_metric
 
 
-def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1):
+def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1, verbose=True):
     w, h, d = image.shape
 
     # if the size of image is less than patch_size, then padding it
@@ -65,7 +66,8 @@ def test_single_case(net, image, stride_xy, stride_z, patch_size, num_classes=1)
     sx = math.ceil((ww - patch_size[0]) / stride_xy) + 1
     sy = math.ceil((hh - patch_size[1]) / stride_xy) + 1
     sz = math.ceil((dd - patch_size[2]) / stride_z) + 1
-    print("{}, {}, {}".format(sx, sy, sz))
+    if verbose:
+        print("{}, {}, {}".format(sx, sy, sz))
     score_map = np.zeros((num_classes, ) + image.shape).astype(np.float32)
     cnt = np.zeros(image.shape).astype(np.float32)
 

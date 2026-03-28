@@ -212,7 +212,8 @@ if __name__ == "__main__":
                         patch_size=(112, 112, 80),
                         stride_xy=18,
                         stride_z=4,
-                        save_result=False
+                        save_result=False,
+                        verbose=False
                     )
                 dice, jc, hd95, asd = avg_metric
                 logging.info(
