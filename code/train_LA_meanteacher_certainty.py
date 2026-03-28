@@ -160,10 +160,10 @@ if __name__ == "__main__":
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
     printed_memory = False
-    trainable_params = (count_params(model) + count_params(ema_model))
+    trainable_params = (count_params(model) + count_params(ema_model) + count_params(ema_aux_model))
     # Parameter memory footprint (MB), based on current tensor dtype.
     param_size_mb = sum(
-        p.numel() * p.element_size() for p in list(model.parameters()) + list(ema_model.parameters()) if p.requires_grad
+        p.numel() * p.element_size() for p in list(model.parameters()) + list(ema_model.parameters()) + list(ema_aux_model.parameters()) if p.requires_grad
     ) / (1024 ** 2)
     logging.info('Model Trainable Params: %d (%.2f MB)', trainable_params, param_size_mb)
     if torch.cuda.is_available():
