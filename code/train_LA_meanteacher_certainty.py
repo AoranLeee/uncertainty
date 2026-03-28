@@ -21,22 +21,23 @@ from networks.vnet import VNet
 from dataloaders import utils
 from utils import ramps, losses
 from dataloaders.la_heart import LAHeart, RandomCrop, CenterCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
+from test_util import test_all_case
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str, default='../data/2018LA_Seg_Training Set/', help='Name of Experiment')
-parser.add_argument('--exp', type=str,  default='UAMT', help='model_name')
+parser.add_argument('--exp', type=str,  default='UAMT', help='model_name') # model_name
 parser.add_argument('--max_iterations', type=int,  default=6000, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--labeled_bs', type=int, default=2, help='labeled_batch_size per gpu')
 parser.add_argument('--base_lr', type=float,  default=0.01, help='maximum epoch number to train')
-parser.add_argument('--deterministic', type=int,  default=1, help='whether use deterministic training')
+parser.add_argument('--deterministic', type=int,  default=1, help='whether use deterministic training')#是否使用确定性训练
 parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
 ### costs
-parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
+parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')# 指数移动平均衰减率
 parser.add_argument('--consistency_type', type=str,  default="mse", help='consistency_type')
-parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')
-parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')
+parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')# 无监督损失的权重
+parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')# 无监督权重的增长周期
 args = parser.parse_args()
 
 train_data_path = args.root_path
@@ -59,6 +60,9 @@ if args.deterministic:
 
 num_classes = 2
 patch_size = (112, 112, 80)
+
+def count_params(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
@@ -108,6 +112,10 @@ if __name__ == "__main__":
                            CenterCrop(patch_size),
                            ToTensor()
                        ]))
+    with open(train_data_path + '/../test.list', 'r') as f:
+        image_list = f.readlines()
+    image_list = [train_data_path + item.replace('\n', '') + "/mri_norm2.h5" for item in image_list]
+
     labeled_idxs = list(range(16))
     unlabeled_idxs = list(range(16, 80))
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size-labeled_bs)
@@ -130,14 +138,24 @@ if __name__ == "__main__":
     logging.info("{} itertations per epoch".format(len(trainloader)))
 
     iter_num = 0
+    count_iter = 150
+    best_dice = 0.0
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
+    printed_memory = False
+    trainable_params = (count_params(model) + count_params(ema_model))
+    # Parameter memory footprint (MB), based on current tensor dtype.
+    param_size_mb = sum(
+        p.numel() * p.element_size() for p in list(model.parameters()) + list(ema_model.parameters()) if p.requires_grad
+    ) / (1024 ** 2)
+    logging.info('Model Trainable Params: %d (%.2f MB)', trainable_params, param_size_mb)
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     model.train()
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
+        #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
         for i_batch, sampled_batch in enumerate(trainloader):
-            time2 = time.time()
-            # print('fetch data cost {}'.format(time2-time1))
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
@@ -146,6 +164,7 @@ if __name__ == "__main__":
             outputs = model(volume_batch)
             with torch.no_grad():
                 ema_output = ema_model(ema_inputs)
+            
             T = 8
             volume_batch_r = volume_batch.repeat(2, 1, 1, 1, 1)
             stride = volume_batch_r.shape[0] // 2
@@ -175,9 +194,42 @@ if __name__ == "__main__":
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if torch.cuda.is_available() and not printed_memory:
+                torch.cuda.synchronize()
+                peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
+                logging.info('GPU Peak Memory (after first batch): %.2f GB', peak_alloc_gb)
+                printed_memory = True
             update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
             iter_num = iter_num + 1
+            if iter_num % count_iter == 0:
+                model.eval()
+                with torch.no_grad():
+                    avg_metric = test_all_case(
+                        model,
+                        image_list,
+                        num_classes=num_classes,
+                        patch_size=(112, 112, 80),
+                        stride_xy=18,
+                        stride_z=4,
+                        save_result=False
+                    )
+                dice, jc, hd95, asd = avg_metric
+                logging.info(
+                    'iteration %d : val_dice: %.4f val_jc: %.4f val_hd95: %.4f val_asd: %.4f'
+                    % (iter_num, dice, jc, hd95, asd)
+                )
+                writer.add_scalar('val/dice', dice, iter_num)
+                if dice > best_dice:
+                    best_dice = dice
+                    save_path = os.path.join(
+                        snapshot_path,
+                        f"dice{dice:.4f}_iter{iter_num}.pth"
+                    )
+                    torch.save(model.state_dict(), save_path)
+                    logging.info("save best model to {}".format(save_path))
+                model.train()
+
             writer.add_scalar('uncertainty/mean', uncertainty[0,0].mean(), iter_num)
             writer.add_scalar('uncertainty/max', uncertainty[0,0].max(), iter_num)
             writer.add_scalar('uncertainty/min', uncertainty[0,0].min(), iter_num)
