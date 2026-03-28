@@ -95,3 +95,24 @@ def symmetric_mse_loss(input1, input2):
     """
     assert input1.size() == input2.size()
     return torch.mean((input1 - input2)**2)
+
+def softmax_ce_loss(input_logits, target_logits, threshold=0.6):
+    """Takes softmax on both sides and returns conf-cross entropy loss
+
+    Note:
+    - Returns the sum over all examples. Divide by the batch size afterwards
+      if you want the mean.
+    - Sends gradients to inputs but not the targets.
+    """
+    #计算ce loss,学生，教师
+    assert input_logits.size() == target_logits.size()
+    input_softmax = F.softmax(input_logits, dim=1)
+    target_softmax = F.softmax(target_logits, dim=1)
+
+    weight = target_softmax.max(1)[0] #计算每个像素的最大概率值
+    mask = (weight >= threshold)
+
+    ce_loss = F.cross_entropy(input_logits, torch.argmax(target_softmax, dim=1), reduction="none")
+    ce_loss = ce_loss * weight
+
+    return ce_loss[mask].mean()

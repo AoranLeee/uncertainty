@@ -64,8 +64,15 @@ patch_size = (112, 112, 80)
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
+def format_duration_h_m(seconds):
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    return f"{hours} h {mins} mins"
+
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    ##0到40的迭代次数中，权重从0.0006增长到0.1，40步之后一直维持0.1
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
 
 def update_ema_variables(model, ema_model, alpha, global_step):
@@ -98,13 +105,14 @@ if __name__ == "__main__":
 
     model = create_model()
     ema_model = create_model(ema=True)
+    ema_aux_model = create_model(ema=True)#增加辅助教师
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
                        transform = transforms.Compose([
-                          RandomRotFlip(),
-                          RandomCrop(patch_size),
-                          ToTensor(),
+                          RandomRotFlip(),#随机翻转
+                          RandomCrop(patch_size),#随机裁剪成112*112*80
+                          ToTensor(),#转化为tensor
                           ]))
     db_test = LAHeart(base_dir=train_data_path,
                        split='test',
@@ -125,21 +133,30 @@ if __name__ == "__main__":
 
     model.train()
     ema_model.train()
+    ema_aux_model.train()
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
     if args.consistency_type == 'mse':
         consistency_criterion = losses.softmax_mse_loss
     elif args.consistency_type == 'kl':
         consistency_criterion = losses.softmax_kl_loss
+    elif args.consistency_type == 'ce':
+        consistency_criterion = losses.softmax_ce_loss #记得补全
     else:
         assert False, args.consistency_type
 
     writer = SummaryWriter(snapshot_path+'/log')
     logging.info("{} itertations per epoch".format(len(trainloader)))
 
+    #用于验证集
     iter_num = 0
     count_iter = 150
     best_dice = 0.0
+    best_iter = 0
+    best_jc = 0.0
+    best_hd95 = 0.0
+    best_asd = 0.0
+
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
     printed_memory = False
@@ -152,6 +169,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     model.train()
+    train_start_time = time.time()
+
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
@@ -160,23 +179,20 @@ if __name__ == "__main__":
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
             noise = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)
+            noise1 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声1
+            noise2 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声2
             ema_inputs = volume_batch + noise
             outputs = model(volume_batch)
             with torch.no_grad():
-                ema_output = ema_model(ema_inputs)
-            
-            T = 8
-            volume_batch_r = volume_batch.repeat(2, 1, 1, 1, 1)
-            stride = volume_batch_r.shape[0] // 2
-            preds = torch.zeros([stride * T, 2, 112, 112, 80]).cuda()
-            for i in range(T//2):
-                ema_inputs = volume_batch_r + torch.clamp(torch.randn_like(volume_batch_r) * 0.1, -0.2, 0.2)
-                with torch.no_grad():
-                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_model(ema_inputs)
+                ema_output = ema_model(volume_batch + noise1)
+                ema_aux_output = ema_aux_model(volume_batch + noise2)
+            # 计算 ema_output 和 ema_aux_output 的均值
+            ema_avg_output = (ema_output + ema_aux_output) / 2.0
+
+            preds = ema_avg_output
             preds = F.softmax(preds, dim=1)
-            preds = preds.reshape(T, stride, 2, 112, 112, 80)
-            preds = torch.mean(preds, dim=0)  #(batch, 2, 112,112,80)
-            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True) #(batch, 1, 112,112,80)
+            #计算每个像素/体素的熵
+            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
 
             ## calculate the loss
             loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
@@ -199,7 +215,10 @@ if __name__ == "__main__":
                 peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 logging.info('GPU Peak Memory (after first batch): %.2f GB', peak_alloc_gb)
                 printed_memory = True
-            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            if(epoch_num % 2==0):
+                update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            else: 
+                update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
 
             iter_num = iter_num + 1
             if iter_num % count_iter == 0:
@@ -223,6 +242,10 @@ if __name__ == "__main__":
                 writer.add_scalar('val/dice', dice, iter_num)
                 if dice > best_dice:
                     best_dice = dice
+                    best_iter = iter_num
+                    best_jc = jc
+                    best_hd95 = hd95
+                    best_asd = asd
                     save_path = os.path.join(
                         snapshot_path,
                         f"dice{dice:.4f}_iter{iter_num}.pth"
@@ -289,10 +312,6 @@ if __name__ == "__main__":
                 lr_ = base_lr * 0.1 ** (iter_num // 2500)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr_
-            if iter_num % 1000 == 0:
-                save_mode_path = os.path.join(snapshot_path, 'iter_' + str(iter_num) + '.pth')
-                torch.save(model.state_dict(), save_mode_path)
-                logging.info("save model to {}".format(save_mode_path))
 
             if iter_num >= max_iterations:
                 break
@@ -302,4 +321,10 @@ if __name__ == "__main__":
     save_mode_path = os.path.join(snapshot_path, 'iter_'+str(max_iterations)+'.pth')
     torch.save(model.state_dict(), save_mode_path)
     logging.info("save model to {}".format(save_mode_path))
+    train_time_str = format_duration_h_m(time.time() - train_start_time)
+    logging.info(
+        'best val result : iter %d : dice: %.4f jc: %.4f hd95: %.4f asd: %.4f',
+        best_iter, best_dice, best_jc, best_hd95, best_asd
+    )
+    logging.info('training time: %s', train_time_str)
     writer.close()
