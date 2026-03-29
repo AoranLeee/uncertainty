@@ -119,7 +119,7 @@ if __name__ == "__main__":
 
     model = create_model()
     ema_model = create_model(ema=True)
-    ema_aux_model = create_model(ema=True)#增加辅助教师
+    # ema_aux_model = create_model(ema=True)#增加辅助教师
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -148,17 +148,11 @@ if __name__ == "__main__":
         torch.manual_seed(worker_seed)
     data_loader_generator = torch.Generator()
     data_loader_generator.manual_seed(args.seed)
-    loader_num_workers = args.num_workers
-    if args.deterministic and loader_num_workers != 0:
-        logging.warning(
-            "deterministic mode forces num_workers=0 for strict reproducibility (requested %d).",
-            loader_num_workers
-        )
-        loader_num_workers = 0
+    
     trainloader = DataLoader(
         db_train,
         batch_sampler=batch_sampler,
-        num_workers=loader_num_workers,
+        num_workers=args.num_workers,
         pin_memory=True,
         worker_init_fn=worker_init_fn,
         generator=data_loader_generator
@@ -166,7 +160,7 @@ if __name__ == "__main__":
 
     model.train()
     ema_model.train()
-    ema_aux_model.train()
+    #ema_aux_model.train()
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
     if args.consistency_type == 'mse':
@@ -174,7 +168,7 @@ if __name__ == "__main__":
     elif args.consistency_type == 'kl':
         consistency_criterion = losses.softmax_kl_loss
     elif args.consistency_type == 'ce':
-        consistency_criterion = losses.softmax_ce_loss #记得补全
+        consistency_criterion = losses.softmax_ce_loss
     else:
         assert False, args.consistency_type
 
@@ -197,20 +191,18 @@ if __name__ == "__main__":
     printed_memory = False
     student_param_mb = params_to_mb(model, trainable_only=False)
     ema_param_mb = params_to_mb(ema_model, trainable_only=False)
-    ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
-    total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
-    student_trainable_mb = params_to_mb(model, trainable_only=True)
-    ema_trainable_mb = params_to_mb(ema_model, trainable_only=True)
-    ema_aux_trainable_mb = params_to_mb(ema_aux_model, trainable_only=True)
-    total_trainable_mb = student_trainable_mb + ema_trainable_mb + ema_aux_trainable_mb
+    # ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
+    # total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
+    total_param_mb = student_param_mb + ema_param_mb
+    # logging.info(
+    #     'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+    #     student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
+    # )
     logging.info(
-        'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
-        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
-    )
-    logging.info(
-        'Model Trainable Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
-        student_trainable_mb, ema_trainable_mb, ema_aux_trainable_mb, total_trainable_mb
-    )
+         'Model Total Params(MB) - student: %.2f, ema: %.2f, total: %.2f',
+         student_param_mb, ema_param_mb, total_param_mb
+     )
+
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     model.train()
@@ -244,15 +236,28 @@ if __name__ == "__main__":
             ema_inputs = volume_batch + noise
             outputs = model(volume_batch)
             with torch.no_grad():
-                ema_output = ema_model(volume_batch + noise1)
-                ema_aux_output = ema_aux_model(volume_batch + noise2)
+                ema_output = ema_model(volume_batch + noise)
+                #ema_aux_output = ema_aux_model(volume_batch + noise2)
             # 计算 ema_output 和 ema_aux_output 的均值
-            ema_avg_output = (ema_output + ema_aux_output) / 2.0
+            #ema_avg_output = (ema_output + ema_aux_output) / 2.0
 
-            preds = ema_avg_output
+            # preds = ema_avg_output
+            # preds = F.softmax(preds, dim=1)
+            # #计算每个像素/体素的熵
+            # uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
+
+            T = 8
+            volume_batch_r = volume_batch.repeat(2, 1, 1, 1, 1)
+            stride = volume_batch_r.shape[0] // 2
+            preds = torch.zeros([stride * T, 2, 112, 112, 80]).cuda()
+            for i in range(T//2):
+                ema_inputs = volume_batch_r + torch.clamp(torch.randn_like(volume_batch_r) * 0.1, -0.2, 0.2)
+                with torch.no_grad():
+                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_model(ema_inputs)
             preds = F.softmax(preds, dim=1)
-            #计算每个像素/体素的熵
-            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
+            preds = preds.reshape(T, stride, 2, 112, 112, 80)
+            preds = torch.mean(preds, dim=0)  #(batch, 2, 112,112,80)
+            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True) #(batch, 1, 112,112,80)
 
             ## calculate the loss
             loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
@@ -275,10 +280,11 @@ if __name__ == "__main__":
                 peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 logging.info('GPU Peak Memory (after first batch): %.2f GB', peak_alloc_gb)
                 printed_memory = True
-            if(epoch_num % 2==0):
-                update_ema_variables(model, ema_model, args.ema_decay, iter_num)
-            else: 
-                update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
+            # if(epoch_num % 2==0):
+            #     update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            # else: 
+            #     update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
+            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
 
             iter_num = iter_num + 1
             if iter_num % count_iter == 0:
