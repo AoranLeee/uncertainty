@@ -59,16 +59,23 @@ if args.deterministic:
     torch.cuda.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     if hasattr(torch, "use_deterministic_algorithms"):
-        torch.use_deterministic_algorithms(True)
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            torch.use_deterministic_algorithms(True)
 
 num_classes = 2
 patch_size = (112, 112, 80)
 
-def count_params(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def count_params(model, trainable_only=True):
+    if trainable_only:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return sum(p.numel() for p in model.parameters())
 
-def params_to_mb(model):
-    return sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad) / (1024 ** 2)
+def params_to_mb(model, trainable_only=True):
+    if trainable_only:
+        return sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad) / (1024 ** 2)
+    return sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)
 
 def format_duration_h_m(seconds):
     total_seconds = int(seconds)
@@ -178,21 +185,21 @@ if __name__ == "__main__":
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
     printed_memory = False
-    student_params = count_params(model)
-    ema_params = count_params(ema_model)
-    ema_aux_params = count_params(ema_aux_model)
-    total_params = student_params + ema_params + ema_aux_params
-    student_param_mb = params_to_mb(model)
-    ema_param_mb = params_to_mb(ema_model)
-    ema_aux_param_mb = params_to_mb(ema_aux_model)
+    student_param_mb = params_to_mb(model, trainable_only=False)
+    ema_param_mb = params_to_mb(ema_model, trainable_only=False)
+    ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
     total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
+    student_trainable_mb = params_to_mb(model, trainable_only=True)
+    ema_trainable_mb = params_to_mb(ema_model, trainable_only=True)
+    ema_aux_trainable_mb = params_to_mb(ema_aux_model, trainable_only=True)
+    total_trainable_mb = student_trainable_mb + ema_trainable_mb + ema_aux_trainable_mb
     logging.info(
-        'Model Trainable Params(numel) - student: %d, ema: %d, ema_aux: %d, total: %d',
-        student_params, ema_params, ema_aux_params, total_params
+        'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
     )
     logging.info(
-        'Model Param Memory(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
-        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
+        'Model Trainable Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+        student_trainable_mb, ema_trainable_mb, ema_aux_trainable_mb, total_trainable_mb
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
