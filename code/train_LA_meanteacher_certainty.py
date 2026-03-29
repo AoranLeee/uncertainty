@@ -29,14 +29,13 @@ parser.add_argument('--exp', type=str,  default='UAMT', help='model_name') # mod
 parser.add_argument('--max_iterations', type=int,  default=6000, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--labeled_bs', type=int, default=2, help='labeled_batch_size per gpu')
-parser.add_argument('--num_workers', type=int, default=0, help='num_workers for DataLoader (use 0 for strongest reproducibility)')
 parser.add_argument('--base_lr', type=float,  default=0.01, help='maximum epoch number to train')
 parser.add_argument('--deterministic', type=int,  default=1, help='whether use deterministic training')#是否使用确定性训练
 parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
 ### costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')# 指数移动平均衰减率
-parser.add_argument('--consistency_type', type=str,  default="ce", help='consistency_type')
+parser.add_argument('--consistency_type', type=str,  default="mse", help='consistency_type')
 parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')# 无监督损失的权重
 parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')# 无监督权重的增长周期
 args = parser.parse_args()
@@ -52,18 +51,12 @@ base_lr = args.base_lr
 labeled_bs = args.labeled_bs
 
 if args.deterministic:
-    cudnn.benchmark = False
+    cudnn.benchmark = False 
     cudnn.deterministic = True
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    if hasattr(torch, "use_deterministic_algorithms"):
-        try:
-            torch.use_deterministic_algorithms(True, warn_only=True)
-        except TypeError:
-            torch.use_deterministic_algorithms(True)
 
 num_classes = 2
 patch_size = (112, 112, 80)
@@ -142,21 +135,9 @@ if __name__ == "__main__":
     unlabeled_idxs = list(range(16, 80))
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size-labeled_bs)
     def worker_init_fn(worker_id):
-        worker_seed = torch.initial_seed() % (2 ** 32)
-        random.seed(worker_seed)
-        np.random.seed(worker_seed)
-        torch.manual_seed(worker_seed)
-    data_loader_generator = torch.Generator()
-    data_loader_generator.manual_seed(args.seed)
-    
-    trainloader = DataLoader(
-        db_train,
-        batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        worker_init_fn=worker_init_fn,
-        generator=data_loader_generator
-    )
+        random.seed(args.seed+worker_id)
+
+    trainloader = DataLoader(db_train,batch_sampler=batch_sampler,num_workers=0,pin_memory=True,worker_init_fn=worker_init_fn)
 
     model.train()
     ema_model.train()
@@ -209,23 +190,10 @@ if __name__ == "__main__":
     train_start_time = time.time()
 
     for epoch_num in tqdm(range(max_epoch), ncols=70):
-        if args.deterministic:
-            epoch_seed = args.seed + epoch_num
-            random.seed(epoch_seed)
-            np.random.seed(epoch_seed)
-            torch.manual_seed(epoch_seed)
-            torch.cuda.manual_seed_all(epoch_seed)
         time1 = time.time()
         trainloader_iter = iter(trainloader)
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
         for i_batch in range(len(trainloader)):
-            if args.deterministic:
-                # Fix RNG state per-iteration so same iter gets same sample transform across runs.
-                iter_seed = args.seed + epoch_num * len(trainloader) + i_batch
-                random.seed(iter_seed)
-                np.random.seed(iter_seed)
-                torch.manual_seed(iter_seed)
-                torch.cuda.manual_seed_all(iter_seed)
             sampled_batch = next(trainloader_iter)
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
