@@ -35,7 +35,7 @@ parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
 ### costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')# 指数移动平均衰减率
-parser.add_argument('--consistency_type', type=str,  default="mse", help='consistency_type')
+parser.add_argument('--consistency_type', type=str,  default="ce", help='consistency_type')
 parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')# 无监督损失的权重
 parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')# 无监督权重的增长周期
 args = parser.parse_args()
@@ -57,12 +57,18 @@ if args.deterministic:
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    if hasattr(torch, "use_deterministic_algorithms"):
+        torch.use_deterministic_algorithms(True)
 
 num_classes = 2
 patch_size = (112, 112, 80)
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def params_to_mb(model):
+    return sum(p.numel() * p.element_size() for p in model.parameters() if p.requires_grad) / (1024 ** 2)
 
 def format_duration_h_m(seconds):
     total_seconds = int(seconds)
@@ -128,8 +134,20 @@ if __name__ == "__main__":
     unlabeled_idxs = list(range(16, 80))
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size-labeled_bs)
     def worker_init_fn(worker_id):
-        random.seed(args.seed+worker_id)
-    trainloader = DataLoader(db_train, batch_sampler=batch_sampler, num_workers=4, pin_memory=True,worker_init_fn=worker_init_fn)
+        worker_seed = args.seed + worker_id
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+    data_loader_generator = torch.Generator()
+    data_loader_generator.manual_seed(args.seed)
+    trainloader = DataLoader(
+        db_train,
+        batch_sampler=batch_sampler,
+        num_workers=4,
+        pin_memory=True,
+        worker_init_fn=worker_init_fn,
+        generator=data_loader_generator
+    )
 
     model.train()
     ema_model.train()
@@ -160,12 +178,22 @@ if __name__ == "__main__":
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
     printed_memory = False
-    trainable_params = (count_params(model) + count_params(ema_model) + count_params(ema_aux_model))
-    # Parameter memory footprint (MB), based on current tensor dtype.
-    param_size_mb = sum(
-        p.numel() * p.element_size() for p in list(model.parameters()) + list(ema_model.parameters()) + list(ema_aux_model.parameters()) if p.requires_grad
-    ) / (1024 ** 2)
-    logging.info('Model Trainable Params: %d (%.2f MB)', trainable_params, param_size_mb)
+    student_params = count_params(model)
+    ema_params = count_params(ema_model)
+    ema_aux_params = count_params(ema_aux_model)
+    total_params = student_params + ema_params + ema_aux_params
+    student_param_mb = params_to_mb(model)
+    ema_param_mb = params_to_mb(ema_model)
+    ema_aux_param_mb = params_to_mb(ema_aux_model)
+    total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
+    logging.info(
+        'Model Trainable Params(numel) - student: %d, ema: %d, ema_aux: %d, total: %d',
+        student_params, ema_params, ema_aux_params, total_params
+    )
+    logging.info(
+        'Model Param Memory(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
+    )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     model.train()
