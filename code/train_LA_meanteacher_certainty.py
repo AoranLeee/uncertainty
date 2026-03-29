@@ -35,7 +35,7 @@ parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
 ### costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')# 指数移动平均衰减率
-parser.add_argument('--consistency_type', type=str,  default="mse", help='consistency_type')
+parser.add_argument('--consistency_type', type=str,  default="ce", help='consistency_type')
 parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')# 无监督损失的权重
 parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')# 无监督权重的增长周期
 args = parser.parse_args()
@@ -112,7 +112,7 @@ if __name__ == "__main__":
 
     model = create_model()
     ema_model = create_model(ema=True)
-    # ema_aux_model = create_model(ema=True)#增加辅助教师
+    ema_aux_model = create_model(ema=True)#增加辅助教师
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -141,7 +141,7 @@ if __name__ == "__main__":
 
     model.train()
     ema_model.train()
-    #ema_aux_model.train()
+    ema_aux_model.train()
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
     if args.consistency_type == 'mse':
@@ -172,17 +172,13 @@ if __name__ == "__main__":
     printed_memory = False
     student_param_mb = params_to_mb(model, trainable_only=False)
     ema_param_mb = params_to_mb(ema_model, trainable_only=False)
-    # ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
-    # total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
+    ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
+    total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
     total_param_mb = student_param_mb + ema_param_mb
-    # logging.info(
-    #     'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
-    #     student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
-    # )
     logging.info(
-         'Model Total Params(MB) - student: %.2f, ema: %.2f, total: %.2f',
-         student_param_mb, ema_param_mb, total_param_mb
-     )
+        'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
+    )
 
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -204,28 +200,15 @@ if __name__ == "__main__":
             ema_inputs = volume_batch + noise
             outputs = model(volume_batch)
             with torch.no_grad():
-                ema_output = ema_model(volume_batch + noise)
-                #ema_aux_output = ema_aux_model(volume_batch + noise2)
+                ema_output = ema_model(volume_batch + noise1)
+                ema_aux_output = ema_aux_model(volume_batch + noise2)
             # 计算 ema_output 和 ema_aux_output 的均值
-            #ema_avg_output = (ema_output + ema_aux_output) / 2.0
+            ema_avg_output = (ema_output + ema_aux_output) / 2.0
 
-            # preds = ema_avg_output
-            # preds = F.softmax(preds, dim=1)
-            # #计算每个像素/体素的熵
-            # uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
-
-            T = 8
-            volume_batch_r = volume_batch.repeat(2, 1, 1, 1, 1)
-            stride = volume_batch_r.shape[0] // 2
-            preds = torch.zeros([stride * T, 2, 112, 112, 80]).cuda()
-            for i in range(T//2):
-                ema_inputs = volume_batch_r + torch.clamp(torch.randn_like(volume_batch_r) * 0.1, -0.2, 0.2)
-                with torch.no_grad():
-                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_model(ema_inputs)
+            preds = ema_avg_output
             preds = F.softmax(preds, dim=1)
-            preds = preds.reshape(T, stride, 2, 112, 112, 80)
-            preds = torch.mean(preds, dim=0)  #(batch, 2, 112,112,80)
-            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True) #(batch, 1, 112,112,80)
+            #计算每个像素/体素的熵
+            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
 
             ## calculate the loss
             loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
@@ -248,11 +231,10 @@ if __name__ == "__main__":
                 peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 logging.info('GPU Peak Memory (after first batch): %.2f GB', peak_alloc_gb)
                 printed_memory = True
-            # if(epoch_num % 2==0):
-            #     update_ema_variables(model, ema_model, args.ema_decay, iter_num)
-            # else: 
-            #     update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
-            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            if(epoch_num % 2==0):
+                update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            else: 
+                update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
 
             iter_num = iter_num + 1
             if iter_num % count_iter == 0:
