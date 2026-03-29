@@ -29,6 +29,7 @@ parser.add_argument('--exp', type=str,  default='UAMT', help='model_name') # mod
 parser.add_argument('--max_iterations', type=int,  default=6000, help='maximum epoch number to train')
 parser.add_argument('--batch_size', type=int, default=4, help='batch_size per gpu')
 parser.add_argument('--labeled_bs', type=int, default=2, help='labeled_batch_size per gpu')
+parser.add_argument('--num_workers', type=int, default=0, help='num_workers for DataLoader (use 0 for strongest reproducibility)')
 parser.add_argument('--base_lr', type=float,  default=0.01, help='maximum epoch number to train')
 parser.add_argument('--deterministic', type=int,  default=1, help='whether use deterministic training')#是否使用确定性训练
 parser.add_argument('--seed', type=int,  default=1337, help='random seed')
@@ -141,16 +142,23 @@ if __name__ == "__main__":
     unlabeled_idxs = list(range(16, 80))
     batch_sampler = TwoStreamBatchSampler(labeled_idxs, unlabeled_idxs, batch_size, batch_size-labeled_bs)
     def worker_init_fn(worker_id):
-        worker_seed = args.seed + worker_id
+        worker_seed = torch.initial_seed() % (2 ** 32)
         random.seed(worker_seed)
         np.random.seed(worker_seed)
         torch.manual_seed(worker_seed)
     data_loader_generator = torch.Generator()
     data_loader_generator.manual_seed(args.seed)
+    loader_num_workers = args.num_workers
+    if args.deterministic and loader_num_workers != 0:
+        logging.warning(
+            "deterministic mode forces num_workers=0 for strict reproducibility (requested %d).",
+            loader_num_workers
+        )
+        loader_num_workers = 0
     trainloader = DataLoader(
         db_train,
         batch_sampler=batch_sampler,
-        num_workers=4,
+        num_workers=loader_num_workers,
         pin_memory=True,
         worker_init_fn=worker_init_fn,
         generator=data_loader_generator
@@ -170,7 +178,9 @@ if __name__ == "__main__":
     else:
         assert False, args.consistency_type
 
-    writer = SummaryWriter(snapshot_path+'/log')
+    tb_log_dir = os.path.join(snapshot_path, 'log', time.strftime('%Y%m%d-%H%M%S'))
+    writer = SummaryWriter(tb_log_dir)
+    logging.info("TensorBoard log dir: %s", tb_log_dir)
     logging.info("{} itertations per epoch".format(len(trainloader)))
 
     #用于验证集
@@ -207,9 +217,24 @@ if __name__ == "__main__":
     train_start_time = time.time()
 
     for epoch_num in tqdm(range(max_epoch), ncols=70):
+        if args.deterministic:
+            epoch_seed = args.seed + epoch_num
+            random.seed(epoch_seed)
+            np.random.seed(epoch_seed)
+            torch.manual_seed(epoch_seed)
+            torch.cuda.manual_seed_all(epoch_seed)
         time1 = time.time()
+        trainloader_iter = iter(trainloader)
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
-        for i_batch, sampled_batch in enumerate(trainloader):
+        for i_batch in range(len(trainloader)):
+            if args.deterministic:
+                # Fix RNG state per-iteration so same iter gets same sample transform across runs.
+                iter_seed = args.seed + epoch_num * len(trainloader) + i_batch
+                random.seed(iter_seed)
+                np.random.seed(iter_seed)
+                torch.manual_seed(iter_seed)
+                torch.cuda.manual_seed_all(iter_seed)
+            sampled_batch = next(trainloader_iter)
             volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
