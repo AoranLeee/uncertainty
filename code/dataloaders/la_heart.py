@@ -9,9 +9,10 @@ from torch.utils.data.sampler import Sampler
 
 class LAHeart(Dataset):
     """ LA Dataset """
-    def __init__(self, base_dir=None, split='train', num=None, transform=None):
+    def __init__(self, base_dir=None, split='train', num=None, transform=None,strong_transform=None):
         self._base_dir = base_dir
         self.transform = transform
+        self.strong_transform = strong_transform
         self.sample_list = []
         if split=='train':
             with open(self._base_dir+'/../train.list', 'r') as f:
