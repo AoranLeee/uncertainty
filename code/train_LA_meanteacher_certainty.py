@@ -298,7 +298,7 @@ if __name__ == "__main__":
             logging.info('iteration %d : loss : %f cons_dist: %f, loss_weight: %f' %
                          (iter_num, loss.item(), consistency_dist.item(), consistency_weight))
             if iter_num % 50 == 0:
-                image = weak_labels[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                image = weak_images[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/Image', grid_image, iter_num)
 
@@ -308,7 +308,7 @@ if __name__ == "__main__":
                 grid_image = make_grid(image, 5, normalize=False)
                 writer.add_image('train/Predicted_label', grid_image, iter_num)
 
-                image = weak_images[0, :, :, 20:61:10].permute(2, 0, 1)
+                image = weak_labels[0, :, :, 20:61:10].permute(2, 0, 1)
                 grid_image = make_grid(utils.decode_seg_map_sequence(image.data.cpu().numpy()), 5, normalize=False)
                 writer.add_image('train/Groundtruth_label', grid_image, iter_num)
 
