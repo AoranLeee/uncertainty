@@ -20,7 +20,7 @@ from torchvision.utils import make_grid
 from networks.vnet import VNet
 from dataloaders import utils
 from utils import ramps, losses, uncertainty_calculate
-from dataloaders.la_heart import LAHeart, RandomCrop, CenterCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
+from dataloaders.la_heart import LAHeart, RandomCrop, CenterCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler,ColorJitter3D,GaussianBlur3D
 from test_util import test_all_case
 
 parser = argparse.ArgumentParser()
@@ -114,13 +114,20 @@ if __name__ == "__main__":
     ema_model = create_model(ema=True)
     ema_aux_model = create_model(ema=True)#增加辅助教师
 
+    kernel_size = int(random.random() * 4.95)
+    kernel_size = kernel_size + 1 if kernel_size % 2 == 0 else kernel_size
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
                        transform = transforms.Compose([
-                          RandomRotFlip(),#随机翻转
+                          RandomRotFlip(), #随机翻转
                           RandomCrop(patch_size),#随机裁剪成112*112*80
                           ToTensor(),#转化为tensor
-                          ]))
+                          ]),
+                        strong_transform = transforms.Compose([
+                          ColorJitter3D(brightness=0.5, contrast=0.5),  # 3D 颜色抖动
+                          GaussianBlur3D(kernel_size, sigma=(0.1, 2.0))  # 3D 高斯模糊
+                        ])
+                        )
     db_test = LAHeart(base_dir=train_data_path,
                        split='test',
                        transform = transforms.Compose([
@@ -178,7 +185,6 @@ if __name__ == "__main__":
     ema_param_mb = params_to_mb(ema_model, trainable_only=False)
     ema_aux_param_mb = params_to_mb(ema_aux_model, trainable_only=False)
     total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
-    total_param_mb = student_param_mb + ema_param_mb
     logging.info(
         'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
         student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
@@ -191,26 +197,27 @@ if __name__ == "__main__":
 
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
-        trainloader_iter = iter(trainloader)
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
-        for i_batch in range(len(trainloader)):
-            sampled_batch = next(trainloader_iter)
-            volume_batch, label_batch = sampled_batch['image'], sampled_batch['label']
-            volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
+        for i_batch, sampled_batch in enumerate(trainloader):
+            weak_images = sampled_batch['weak_image']  # 弱增强的图像
+            weak_labels = sampled_batch['weak_label']  # 弱增强的标签
+            strong_images = sampled_batch['strong_image']  # 强增强的图像
+            
+            weak_images,weak_labels= weak_images.cuda(), weak_labels.cuda()
+            strong_images= strong_images.cuda()
 
-            noise = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)
-            noise1 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声1
-            noise2 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声2
-            ema_inputs = volume_batch + noise
-            outputs = model(volume_batch + noise)
+            noise = torch.clamp(torch.randn_like(strong_images) * 0.1, -0.2, 0.2)#生成高斯噪声
+            noise1 = torch.clamp(torch.randn_like(strong_images) * 0.2, -0.2, 0.2)#生成高斯噪声
+            outputs = model(strong_images + noise1) #学生模型输出
+
             with torch.no_grad():
-                ema_output = ema_model(volume_batch)
-                ema_aux_output = ema_aux_model(volume_batch + noise1)
+                ema_output = ema_model(weak_images) #教师模型输出
+                ema_aux_output = ema_aux_model(weak_images + noise)
 
             # calculate the label loss
-            loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
+            loss_seg = F.cross_entropy(outputs[:labeled_bs], weak_labels[:labeled_bs])
             outputs_soft = F.softmax(outputs, dim=1)
-            loss_seg_dice = losses.dice_loss(outputs_soft[:labeled_bs, 1, :, :, :], label_batch[:labeled_bs] == 1)
+            loss_seg_dice = losses.dice_loss(outputs_soft[:labeled_bs, 1, :, :, :], weak_labels[:labeled_bs] == 1)
 
             T=0.1
             # 数值稳定性：对概率进行裁剪，防止0或1导致NaN
@@ -291,7 +298,7 @@ if __name__ == "__main__":
             logging.info('iteration %d : loss : %f cons_dist: %f, loss_weight: %f' %
                          (iter_num, loss.item(), consistency_dist.item(), consistency_weight))
             if iter_num % 50 == 0:
-                image = volume_batch[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                image = weak_labels[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/Image', grid_image, iter_num)
 
@@ -301,16 +308,16 @@ if __name__ == "__main__":
                 grid_image = make_grid(image, 5, normalize=False)
                 writer.add_image('train/Predicted_label', grid_image, iter_num)
 
-                image = label_batch[0, :, :, 20:61:10].permute(2, 0, 1)
+                image = weak_images[0, :, :, 20:61:10].permute(2, 0, 1)
                 grid_image = make_grid(utils.decode_seg_map_sequence(image.data.cpu().numpy()), 5, normalize=False)
                 writer.add_image('train/Groundtruth_label', grid_image, iter_num)
 
                 image = uncertainty[0][0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/uncertainty', grid_image, iter_num)
-                
+
                 #####
-                image = volume_batch[-1, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                image = weak_images[-1, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('unlabel/Image', grid_image, iter_num)
 
@@ -320,7 +327,7 @@ if __name__ == "__main__":
                 grid_image = make_grid(image, 5, normalize=False)
                 writer.add_image('unlabel/Predicted_label', grid_image, iter_num)
 
-                image = label_batch[-1, :, :, 20:61:10].permute(2, 0, 1)
+                image = weak_labels[-1, :, :, 20:61:10].permute(2, 0, 1)
                 grid_image = make_grid(utils.decode_seg_map_sequence(image.data.cpu().numpy()), 5, normalize=False)
                 writer.add_image('unlabel/Groundtruth_label', grid_image, iter_num)
 

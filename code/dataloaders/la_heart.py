@@ -35,8 +35,17 @@ class LAHeart(Dataset):
         sample = {'image': image, 'label': label}
         if self.transform:
             sample = self.transform(sample)
+            weak_image, weak_label = sample['image'], sample['label']
+        if self.strong_transform:#强图像增强
+            sample = self.strong_transform(sample)
+            strong_image, strong_label = sample['image'], sample['label']
 
-        return sample
+        return {
+            'weak_image': weak_image,
+            'weak_label': weak_label,
+            'strong_image': strong_image,
+            'strong_label': strong_label
+        }
 
 class CenterCrop(object):
     def __init__(self, output_size):
@@ -133,6 +142,80 @@ class RandomNoise(object):
         image = image + noise
         return {'image': image, 'label': label}
 
+class ColorJitter3D:
+    def __init__(self, brightness=0, contrast=0):
+        """
+        3D 图像的颜色抖动（仅支持亮度和对比度调整）
+        :param brightness: 亮度调整范围（如 0.2 表示亮度在 80% 到 120% 之间随机调整）
+        :param contrast: 对比度调整范围（如 0.2 表示对比度在 80% 到 120% 之间随机调整）
+        """
+        self.brightness = brightness
+        self.contrast = contrast
+
+    def __call__(self, sample):
+        """
+        :param img: 输入的 3D 图像，形状为 (D, H, W)
+        :return: 颜色抖动后的 3D 图像
+        :80%概率应用颜色抖动
+        """
+        image, label = sample['image'], sample['label']
+        if self.brightness > 0:
+            brightness_factor = torch.tensor(1.0).uniform_(1 - self.brightness, 1 + self.brightness).item()
+            image = image * brightness_factor
+
+        if self.contrast > 0 and random.random() < 0.8:
+            contrast_factor = torch.tensor(1.0).uniform_(1 - self.contrast, 1 + self.contrast).item()
+            mean = image.mean()
+            image = (image - mean) * contrast_factor + mean
+
+        return {'image': image, 'label': label}
+    
+class GaussianBlur3D:
+    def __init__(self, kernel_size=3, sigma=(0.1, 2.0)):
+        """
+        3D 高斯模糊
+        :param kernel_size: 高斯核大小（必须是奇数）
+        :param sigma: 高斯核标准差范围（如 (0.1, 2.0) 表示标准差在 0.1 到 2.0 之间随机选择）
+        """
+        self.kernel_size = kernel_size
+        self.sigma = sigma
+
+    def __call__(self, sample):
+        """
+        :param img: 输入的 3D 图像，形状为 (D, H, W)，需要是张量类型
+        :return: 高斯模糊后的 3D 图像
+        :50%概率应用高斯模糊
+        """
+        image, label = sample['image'], sample['label']
+        #print("image shape:",image.shape)[1,112,112,80]
+        # 生成 3D 高斯核
+        if random.random() < 0.5:
+            kernel = self._get_gaussian_kernel3d(self.kernel_size, self.sigma)
+            kernel = kernel.to(image.device)
+
+            # 对 3D 图像进行卷积
+            image = image.unsqueeze(0)  # 增加 batch 和 channel 维度
+            image = F.conv3d(image, kernel, padding=self.kernel_size // 2)
+            image = image.squeeze(0)  # 移除 batch 和 channel 维度
+        return {'image': image, 'label': label}
+
+    def _get_gaussian_kernel3d(self, kernel_size, sigma_range):
+        """
+        生成 3D 高斯核
+        :param kernel_size: 高斯核大小
+        :param sigma_range: 高斯核标准差范围
+        :return: 3D 高斯核，形状为 (1, 1, kernel_size, kernel_size, kernel_size)
+        """
+        sigma = torch.empty(1).uniform_(sigma_range[0], sigma_range[1]).item()
+        kernel_1d = torch.arange(-kernel_size // 2 + 1, kernel_size // 2 + 1, dtype=torch.float32)
+        kernel_1d = torch.exp(-kernel_1d ** 2 / (2 * sigma ** 2))
+        kernel_1d = kernel_1d / kernel_1d.sum()
+
+        # 生成 3D 高斯核
+        kernel_3d = torch.einsum('i,j,k->ijk', kernel_1d, kernel_1d, kernel_1d)
+        kernel_3d = kernel_3d / kernel_3d.sum()
+        kernel_3d = kernel_3d.unsqueeze(0).unsqueeze(0)  # 增加 channel 和 batch 维度
+        return kernel_3d
 
 class CreateOnehotLabel(object):
     def __init__(self, num_classes):
