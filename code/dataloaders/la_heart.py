@@ -1,11 +1,14 @@
 import os
 import torch
 import numpy as np
+import random
 from glob import glob
 from torch.utils.data import Dataset
+from torchvision import transforms
 import h5py
 import itertools
 from torch.utils.data.sampler import Sampler
+import torch.nn.functional as F
 
 class LAHeart(Dataset):
     """ LA Dataset """
