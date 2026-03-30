@@ -275,11 +275,9 @@ if __name__ == "__main__":
                     logging.info("save best model to {}".format(save_path))
                 model.train()
 
-            writer.add_scalar('uncertainty/mean', uncertainty[0,0].mean(), iter_num)
-            writer.add_scalar('uncertainty/max', uncertainty[0,0].max(), iter_num)
-            writer.add_scalar('uncertainty/min', uncertainty[0,0].min(), iter_num)
-            writer.add_scalar('uncertainty/mask_per', torch.sum(mask)/mask.numel(), iter_num)
-            writer.add_scalar('uncertainty/threshold', threshold, iter_num)
+            writer.add_scalar('uncertainty/mean', uncertainty[0][0].mean(), iter_num)
+            writer.add_scalar('uncertainty/max', uncertainty[0][0].max(), iter_num)
+            writer.add_scalar('uncertainty/min', uncertainty[0][0].min(), iter_num)
             writer.add_scalar('lr', lr_, iter_num)
             writer.add_scalar('loss/loss', loss, iter_num)
             writer.add_scalar('loss/loss_seg', loss_seg, iter_num)
@@ -307,10 +305,10 @@ if __name__ == "__main__":
                 grid_image = make_grid(utils.decode_seg_map_sequence(image.data.cpu().numpy()), 5, normalize=False)
                 writer.add_image('train/Groundtruth_label', grid_image, iter_num)
 
-                image = uncertainty[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
+                image = uncertainty[0][0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/uncertainty', grid_image, iter_num)
-
+                
                 #####
                 image = volume_batch[-1, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
