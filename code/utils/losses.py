@@ -116,3 +116,41 @@ def softmax_ce_loss(input_logits, target_logits, threshold=0.6):
     ce_loss = ce_loss * weight
 
     return ce_loss[mask].mean()
+
+def softmax_uac_loss(output_logits_list, ema_logits,uncertainty_list):
+    """
+    3D一致性损失函数 l_crc 实现
+    
+    参数：
+        p (Tensor): 参考预测logits，形状 (B, C, H, W, D)
+        pr_list (list of Tensor): 扰动预测logits列表，每个元素形状 (B, C, H, W, D)
+        uncertainty_list (list of Tensor): 不确定性Ur列表，每个元素形状 (B, H, W, D)
+        
+    返回：
+        loss (Tensor): 标量损失值
+    """
+    total_ce_term = 0.0
+    total_ur_term = 0.0
+    
+    # 将参考预测转换为概率分布
+    p_prob = F.softmax(ema_logits, dim=1)  # (B, C, H, W, D)
+    
+    for pr, ur in zip(output_logits_list, uncertainty_list):
+        # 交叉熵: -sum(p * log_pr) over class维度
+        ce_r = F.cross_entropy(pr, torch.argmax(p_prob, dim=1), reduction="none")
+        ce_r=ce_r.unsqueeze(1)#(B, C, H, W, D)
+        
+        # 分母: exp(ur) + eps，防止除零
+        exp_ur = torch.exp(ur).clamp(min=1e-8)  # (B, C, H, W, D)
+        
+        # --- 计算 CE / exp(Ur) ---
+        ce_term = torch.sum((ce_r / exp_ur).clamp(min=1e-8))  # scalar
+        total_ce_term += ce_term
+        
+        # --- 累加 Ur 项 ---
+        ur_term = torch.sum(ur)  # scalar
+        total_ur_term += ur_term
+    
+    total_loss = total_ce_term + total_ur_term
+    total_loss = total_loss/(2*torch.numel(ce_r)*len(output_logits_list))
+    return total_loss, total_ce_term, total_ur_term

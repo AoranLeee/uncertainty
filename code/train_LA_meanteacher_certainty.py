@@ -19,7 +19,7 @@ from torchvision.utils import make_grid
 
 from networks.vnet import VNet
 from dataloaders import utils
-from utils import ramps, losses
+from utils import ramps, losses, uncertainty_calculate
 from dataloaders.la_heart import LAHeart, RandomCrop, CenterCrop, RandomRotFlip, ToTensor, TwoStreamBatchSampler
 from test_util import test_all_case
 
@@ -35,7 +35,7 @@ parser.add_argument('--seed', type=int,  default=1337, help='random seed')
 parser.add_argument('--gpu', type=str,  default='0', help='GPU to use')
 ### costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')# 指数移动平均衰减率
-parser.add_argument('--consistency_type', type=str,  default="ce", help='consistency_type')
+parser.add_argument('--consistency_type', type=str,  default="uac", help='consistency_type')
 parser.add_argument('--consistency', type=float,  default=0.1, help='consistency')# 无监督损失的权重
 parser.add_argument('--consistency_rampup', type=float,  default=40.0, help='consistency_rampup')# 无监督权重的增长周期
 args = parser.parse_args()
@@ -150,8 +150,12 @@ if __name__ == "__main__":
         consistency_criterion = losses.softmax_kl_loss
     elif args.consistency_type == 'ce':
         consistency_criterion = losses.softmax_ce_loss
+    elif args.consistency_type == 'uac':
+        consistency_criterion = losses.softmax_uac_loss
     else:
         assert False, args.consistency_type
+
+    uncertainty_evaluate = uncertainty_calculate.uac_uncertainty
 
     tb_log_dir = os.path.join(snapshot_path, 'log', time.strftime('%Y%m%d-%H%M%S'))
     writer = SummaryWriter(tb_log_dir)
@@ -198,28 +202,29 @@ if __name__ == "__main__":
             noise1 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声1
             noise2 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声2
             ema_inputs = volume_batch + noise
-            outputs = model(volume_batch)
+            outputs = model(volume_batch + noise)
             with torch.no_grad():
-                ema_output = ema_model(volume_batch + noise1)
-                ema_aux_output = ema_aux_model(volume_batch + noise2)
-            # 计算 ema_output 和 ema_aux_output 的均值
-            ema_avg_output = (ema_output + ema_aux_output) / 2.0
+                ema_output = ema_model(volume_batch)
+                ema_aux_output = ema_aux_model(volume_batch + noise1)
 
-            preds = ema_avg_output
-            preds = F.softmax(preds, dim=1)
-            #计算每个像素/体素的熵
-            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
-
-            ## calculate the loss
+            # calculate the label loss
             loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
             outputs_soft = F.softmax(outputs, dim=1)
             loss_seg_dice = losses.dice_loss(outputs_soft[:labeled_bs, 1, :, :, :], label_batch[:labeled_bs] == 1)
 
+            T=0.1
+            # 数值稳定性：对概率进行裁剪，防止0或1导致NaN
+            p_clamped = torch.clamp(ema_output, min=1e-8, max=1.0 - 1e-8)
+            # 计算分子和分母的幂次项
+            inv_T = 1.0 / T
+            p_power = torch.pow(p_clamped, inv_T)
+            one_minus_p_power = torch.pow(1.0 - p_clamped, inv_T)
+            # 计算锐化后的概率,consistency_dist无监督损失
+            sharpened_ema_output = p_power / (p_power + one_minus_p_power + 1e-8)
+            uncertainty = uncertainty_evaluate(ema_output,[ema_aux_output,outputs])
+            consistency_dist,total_ce_term,total_ur_term = consistency_criterion([ema_aux_output,outputs], sharpened_ema_output, uncertainty)
+
             consistency_weight = get_current_consistency_weight(iter_num//150)
-            consistency_dist = consistency_criterion(outputs, ema_output) #(batch, 2, 112,112,80)
-            threshold = (0.75+0.25*ramps.sigmoid_rampup(iter_num, max_iterations))*np.log(2)
-            mask = (uncertainty<threshold).float()
-            consistency_dist = torch.sum(mask*consistency_dist)/(2*torch.sum(mask)+1e-16)
             consistency_loss = consistency_weight * consistency_dist
             loss = 0.5*(loss_seg+loss_seg_dice) + consistency_loss
 
@@ -282,6 +287,8 @@ if __name__ == "__main__":
             writer.add_scalar('train/consistency_loss', consistency_loss, iter_num)
             writer.add_scalar('train/consistency_weight', consistency_weight, iter_num)
             writer.add_scalar('train/consistency_dist', consistency_dist, iter_num)
+            writer.add_scalar('train/total_ce_term', total_ce_term, iter_num)
+            writer.add_scalar('train/total_ur_term', total_ur_term, iter_num)
 
             logging.info('iteration %d : loss : %f cons_dist: %f, loss_weight: %f' %
                          (iter_num, loss.item(), consistency_dist.item(), consistency_weight))
@@ -304,10 +311,6 @@ if __name__ == "__main__":
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/uncertainty', grid_image, iter_num)
 
-                mask2 = (uncertainty > threshold).float()
-                image = mask2[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
-                grid_image = make_grid(image, 5, normalize=True)
-                writer.add_image('train/mask', grid_image, iter_num)
                 #####
                 image = volume_batch[-1, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
