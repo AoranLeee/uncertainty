@@ -61,12 +61,20 @@ if args.deterministic:
 num_classes = 2
 patch_size = (112, 112, 80)
 
-def count_params(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def params_to_mb(model):
+    return sum(p.numel() * p.element_size() for p in model.parameters()) / (1024 ** 2)
+
+def format_duration_h_m(seconds):
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    mins = (total_seconds % 3600) // 60
+    return f"{hours} h {mins} mins"
 
 def get_current_consistency_weight(epoch):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
+    #0到40的迭代次数中，权重从0.0006增长到0.1，40步之后一直维持0.1
     return args.consistency * ramps.sigmoid_rampup(epoch, args.consistency_rampup)
+
 
 def update_ema_variables(model, ema_model, alpha, global_step):
     # Use the true average until the exponential average is more correct
@@ -134,24 +142,33 @@ if __name__ == "__main__":
     else:
         assert False, args.consistency_type
 
-    writer = SummaryWriter(snapshot_path+'/log')
+    tb_log_dir = os.path.join(snapshot_path, 'log', time.strftime('%Y%m%d-%H%M%S'))
+    writer = SummaryWriter(tb_log_dir)
+    logging.info("TensorBoard log dir: %s", tb_log_dir)
     logging.info("{} itertations per epoch".format(len(trainloader)))
 
     iter_num = 0
     count_iter = 150
     best_dice = 0.0
+    best_iter = 0
+    best_jc = 0.0
+    best_hd95 = 0.0
+    best_asd = 0.0
+
     max_epoch = max_iterations//len(trainloader)+1
     lr_ = base_lr
     printed_memory = False
-    trainable_params = (count_params(model) + count_params(ema_model))
-    # Parameter memory footprint (MB), based on current tensor dtype.
-    param_size_mb = sum(
-        p.numel() * p.element_size() for p in list(model.parameters()) + list(ema_model.parameters()) if p.requires_grad
-    ) / (1024 ** 2)
-    logging.info('Model Trainable Params: %d (%.2f MB)', trainable_params, param_size_mb)
+    student_param_mb = params_to_mb(model)
+    ema_param_mb = params_to_mb(ema_model)
+    total_param_mb = student_param_mb + ema_param_mb
+    logging.info(
+        'Model Total Params(MB) - student: %.2f, ema: %.2f, total: %.2f',
+        student_param_mb, ema_param_mb, total_param_mb
+    )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     model.train()
+    train_start_time = time.time()
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
@@ -223,6 +240,10 @@ if __name__ == "__main__":
                 writer.add_scalar('val/dice', dice, iter_num)
                 if dice > best_dice:
                     best_dice = dice
+                    best_iter = iter_num
+                    best_jc = jc
+                    best_hd95 = hd95
+                    best_asd = asd
                     save_path = os.path.join(
                         snapshot_path,
                         f"dice{dice:.4f}_iter{iter_num}.pth"
@@ -246,7 +267,7 @@ if __name__ == "__main__":
 
             logging.info('iteration %d : loss : %f cons_dist: %f, loss_weight: %f' %
                          (iter_num, loss.item(), consistency_dist.item(), consistency_weight))
-            if iter_num % 50 == 0:
+            if iter_num % 5 == 0:
                 image = volume_batch[0, 0:1, :, :, 20:61:10].permute(3, 0, 1, 2).repeat(1, 3, 1, 1)
                 grid_image = make_grid(image, 5, normalize=True)
                 writer.add_image('train/Image', grid_image, iter_num)
@@ -289,10 +310,6 @@ if __name__ == "__main__":
                 lr_ = base_lr * 0.1 ** (iter_num // 2500)
                 for param_group in optimizer.param_groups:
                     param_group['lr'] = lr_
-            if iter_num % 1000 == 0:
-                save_mode_path = os.path.join(snapshot_path, 'iter_' + str(iter_num) + '.pth')
-                torch.save(model.state_dict(), save_mode_path)
-                logging.info("save model to {}".format(save_mode_path))
 
             if iter_num >= max_iterations:
                 break
@@ -302,4 +319,10 @@ if __name__ == "__main__":
     save_mode_path = os.path.join(snapshot_path, 'iter_'+str(max_iterations)+'.pth')
     torch.save(model.state_dict(), save_mode_path)
     logging.info("save model to {}".format(save_mode_path))
+    train_time_str = format_duration_h_m(time.time() - train_start_time)
+    logging.info(
+        'best val result : iter %d : dice: %.4f jc: %.4f hd95: %.4f asd: %.4f',
+        best_iter, best_dice, best_jc, best_hd95, best_asd
+    )
+    logging.info('training time: %s', train_time_str)
     writer.close()
