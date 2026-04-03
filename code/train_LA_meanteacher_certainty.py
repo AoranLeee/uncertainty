@@ -106,6 +106,7 @@ if __name__ == "__main__":
 
     model = create_model()
     ema_model = create_model(ema=True)
+    ema_aux_model = create_model(ema=True)#增加辅助教师
 
     db_train = LAHeart(base_dir=train_data_path,
                        split='train',
@@ -133,12 +134,15 @@ if __name__ == "__main__":
 
     model.train()
     ema_model.train()
+    ema_aux_model.train()
     optimizer = optim.SGD(model.parameters(), lr=base_lr, momentum=0.9, weight_decay=0.0001)
 
     if args.consistency_type == 'mse':
         consistency_criterion = losses.softmax_mse_loss
     elif args.consistency_type == 'kl':
         consistency_criterion = losses.softmax_kl_loss
+    elif args.consistency_type == 'ce':
+        consistency_criterion = losses.softmax_ce_loss #记得补全
     else:
         assert False, args.consistency_type
 
@@ -160,15 +164,17 @@ if __name__ == "__main__":
     printed_memory = False
     student_param_mb = params_to_mb(model)
     ema_param_mb = params_to_mb(ema_model)
-    total_param_mb = student_param_mb + ema_param_mb
+    ema_aux_param_mb = params_to_mb(ema_aux_model)
+    total_param_mb = student_param_mb + ema_param_mb + ema_aux_param_mb
     logging.info(
-        'Model Total Params(MB) - student: %.2f, ema: %.2f, total: %.2f',
-        student_param_mb, ema_param_mb, total_param_mb
+        'Model Total Params(MB) - student: %.2f, ema: %.2f, ema_aux: %.2f, total: %.2f',
+        student_param_mb, ema_param_mb, ema_aux_param_mb, total_param_mb
     )
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
     model.train()
     train_start_time = time.time()
+    
     for epoch_num in tqdm(range(max_epoch), ncols=70):
         time1 = time.time()
         #i_batch是当前批次的索引，sampled_batch是当前批次的数据，包括图像和标签。
@@ -177,23 +183,21 @@ if __name__ == "__main__":
             volume_batch, label_batch = volume_batch.cuda(), label_batch.cuda()
 
             noise = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)
+            noise1 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声1
+            noise2 = torch.clamp(torch.randn_like(volume_batch) * 0.1, -0.2, 0.2)#生成高斯噪声2
+            ema_inputs = volume_batch + noise
             ema_inputs = volume_batch + noise
             outputs = model(volume_batch)
             with torch.no_grad():
-                ema_output = ema_model(ema_inputs)
-            
-            T = 8
-            volume_batch_r = volume_batch.repeat(2, 1, 1, 1, 1)
-            stride = volume_batch_r.shape[0] // 2
-            preds = torch.zeros([stride * T, 2, 112, 112, 80]).cuda()
-            for i in range(T//2):
-                ema_inputs = volume_batch_r + torch.clamp(torch.randn_like(volume_batch_r) * 0.1, -0.2, 0.2)
-                with torch.no_grad():
-                    preds[2 * stride * i:2 * stride * (i + 1)] = ema_model(ema_inputs)
+                ema_output = ema_model(volume_batch + noise1)
+                ema_aux_output = ema_aux_model(volume_batch + noise2)
+            # 计算 ema_output 和 ema_aux_output 的均值
+            ema_avg_output = (ema_output + ema_aux_output) / 2.0
+
+            preds = ema_avg_output
             preds = F.softmax(preds, dim=1)
-            preds = preds.reshape(T, stride, 2, 112, 112, 80)
-            preds = torch.mean(preds, dim=0)  #(batch, 2, 112,112,80)
-            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True) #(batch, 1, 112,112,80)
+            #计算每个像素/体素的熵
+            uncertainty = -1.0*torch.sum(preds*torch.log(preds + 1e-6), dim=1, keepdim=True)
 
             ## calculate the loss
             loss_seg = F.cross_entropy(outputs[:labeled_bs], label_batch[:labeled_bs])
@@ -216,7 +220,10 @@ if __name__ == "__main__":
                 peak_alloc_gb = torch.cuda.max_memory_allocated() / (1024 ** 3)
                 logging.info('GPU Peak Memory (after first batch): %.2f GB', peak_alloc_gb)
                 printed_memory = True
-            update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            if(epoch_num % 2==0):
+                update_ema_variables(model, ema_model, args.ema_decay, iter_num)
+            else: 
+                update_ema_variables(model, ema_aux_model, args.ema_decay, iter_num)
 
             iter_num = iter_num + 1
             if iter_num % count_iter == 0:
